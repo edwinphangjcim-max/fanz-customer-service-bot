@@ -1,39 +1,4 @@
 {
-  "name": "fanz-customer-service-bot",
-  "description": "Fanz Sdn Bhd Customer Service Telegram Bot (Chinese/English)",
-  "logo": null,
-  "repository": "https://github.com/edwinphang4-spec/fanz-customer-service-bot",
-  "keywords": ["telegram", "bot", "customer-service", "fanz"],
-  "env": {
-    "TELEGRAM_TOKEN": {
-      "description": "Telegram Bot Token from @BotFather",
-      "required": true
-    },
-    "OPENROUTER_API_KEY": {
-      "description": "OpenRouter API Key",
-      "required": true
-    },
-    "MODEL": {
-      "description": "OpenRouter model to use (default: gpt-4o)",
-      "required": false
-    },
-    "SUPABASE_URL": {
-      "description": "Supabase project URL",
-      "required": false
-    },
-    "SUPABASE_SERVICE_KEY": {
-      "description": "Supabase service_role key",
-      "required": false
-    },
-    "GOOGLE_SERVICE_ACCOUNT_JSON": {
-      "description": "Google service account JSON for Sheets backup",
-      "required": false
-    },
-    "GOOGLE_SHEET_ID": {
-      "description": "Google Sheet ID for work order backup",
-      "required": false
-    }
-  },
   "buildCommand": "npm install",
   "startCommand": "node index.js"
 }
