@@ -65,7 +65,7 @@ LINE B — Repair / Maintenance: Collect these FIVE things ONE AT A TIME. After 
    Step 3 — Invoice number (tell them need invoice to check warranty)
    Step 4 — Address for service visit
    Step 5 — Preferred date and time
-After all 5 collected, do NOT write any closing message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
+After all 5 collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
    **IMPORTANT — data output format**: On the LAST LINE of your response, output EXACTLY this format (no extra characters):
    ||DATA||{"model":"[model]","issue":"[issue]","invoice":"[invoice]","address":"[address]","preferred_time":"[time]"}||END||[WORKORDER_READY]
    Replace [bracketed] fields with what customer provided. If any field missing, use empty string. This line is internal, will be stripped before customer sees it.
@@ -74,9 +74,9 @@ LINE C — Complaint: Listen properly, acknowledge, say will pass to the relevan
    **IMPORTANT — data output format**: When wrapping up, on the LAST LINE output:
    ||DATA||{"category":"product|installation|logistics|other","content":"[summary of complaint]"}||END||[COMPLAINT_READY]
 
-4. HANDOFF TO HUMAN: If customer angry, asking something you can't handle, or wants human, reply (Chinese): "了解，我帮您转人工同事跟进。麻烦留个联络号码，24小时内会有人联系您。" / (English): "Noted, let me pass you to a human colleague. Drop your contact number, someone will reach out within 24 hours."
+4. HANDOFF TO HUMAN: If customer angry, asking something you can't handle, or wants human, reply (Chinese): "了解，我帮你转给同事跟进。麻烦留个联络号码，24小时内有人联系你。" / (English): "Noted, let me pass you to a human colleague. Drop your contact number, someone will reach out within 24 hours."
 
-5. LANGUAGE: Match customer's language. If they mix Chinese and English (rojak style), you can mix naturally too. Chinese style: Malaysian Chinese, casual WhatsApp tone — short sentences, no mainland Chinese officialese ("请您"、"为您服务"、"亲"). Use natural words like 师傅, 上门, 联络, 报修, 麻烦, 帮您看下, 没问题, 好的, 收到. English style: short, plain Malaysian business English. No flowery phrases.
+5. LANGUAGE: Match customer's language. If they mix Chinese and English (rojak style), you can mix naturally too. Chinese style: Malaysian Chinese, casual WhatsApp tone — short sentences, no mainland Chinese officialese ("请您"、"为您服务"、"亲"). Use natural words like 师傅, 上门, 联络, 报修, 麻烦, 帮你看下, 没问题, 好的, 收到. English style: short, plain Malaysian business English. No flowery phrases.
 
 6. PERSONALITY:
    - Short, direct, friendly. One question at a time.
@@ -278,34 +278,50 @@ function detectLang(text) {
   return /[一-鿿]/.test(text || "") ? "zh" : "en";
 }
 
+// Detect language from conversation history (last 3 user messages + current text)
+function detectLangFromHistory(chatId, currentText) {
+  // Check current text first
+  if (detectLang(currentText) === "zh") return "zh";
+  // Check last 3 user messages in history
+  const history = getHistory(chatId);
+  let checked = 0;
+  for (let i = history.length - 1; i >= 0 && checked < 3; i--) {
+    if (history[i].role === "user") {
+      if (detectLang(history[i].content) === "zh") return "zh";
+      checked++;
+    }
+  }
+  return "en";
+}
+
 const TRANSLATIONS = {
   warranty_in: {
     en: ({ model, date }) => `✅ Your fan (${model}, purchased ${date}) is within the 10-year warranty period.`,
-    zh: ({ model, date }) => `✅ 您的吊扇 (${model}，购买日期 ${date}) 在 10 年保修期内。`,
+    zh: ({ model, date }) => `✅ 你的风扇 (${model}，买于 ${date}) 还在 10 年保修期内。`,
   },
   warranty_out: {
     en: ({ model, date }) => `⚠️ Your fan (${model}, purchased ${date}) is outside the 10-year warranty period. Our team will provide a service quotation.`,
-    zh: ({ model, date }) => `⚠️ 您的吊扇 (${model}，购买日期 ${date}) 已超过 10 年保修期。我们的团队将为您提供维修报价。`,
+    zh: ({ model, date }) => `⚠️ 你的风扇 (${model}，买于 ${date}) 已经过了 10 年保修期。我们会再报维修费用给你。`,
   },
   warranty_not_found: {
     en: "ℹ️ We could not find this invoice in our system. A colleague will manually verify your warranty status.",
-    zh: "ℹ️ 系统中找不到此发票号码。我们的同事将手动核实您的保修状态。",
+    zh: "ℹ️ 找不到这个 invoice 号码。同事会帮你手动查一下保修。",
   },
   workorder_recorded: {
     en: "✅ Your repair request has been recorded. Our technician will contact you to arrange the visit.",
-    zh: "✅ 您的维修申请已记录。我们的技术员将与您联系安排上门时间。",
+    zh: "✅ 维修申请已收到。师傅会联络你安排上门。",
   },
   workorder_busy: {
     en: "⚠️ System is temporarily busy. Your request has been forwarded to our human team who will follow up with you. Thank you for your patience.",
-    zh: "⚠️ 系统暂时繁忙。您的申请已转交给我们的人工团队跟进。感谢您的耐心等待。",
+    zh: "⚠️ 系统暂时 busy。你的申请已转给同事跟进，他们会联络你。",
   },
   complaint_busy: {
     en: "⚠️ System is temporarily busy. Your feedback has been forwarded to our human team who will personally follow up with you.",
-    zh: "⚠️ 系统暂时繁忙。您的反馈已转交给我们的人工团队亲自跟进。",
+    zh: "⚠️ 系统暂时 busy。你的反馈已转给同事亲自跟进。",
   },
   error_connect: {
     en: "Sorry, I'm having trouble connecting right now. Please try again later.",
-    zh: "抱歉，我现在连接出现问题，请稍后再试。",
+    zh: "抱歉，我暂时连不上，请稍后再试。",
   },
 };
 
@@ -338,25 +354,25 @@ function parseMarker(reply) {
 // ── Welcome Message ──────────────────────────────
 function buildWelcome() {
   return {
-    zh: `您好！欢迎来到 Fanz Sdn Bhd 客服中心 🏠
+    zh: `你好！欢迎来到 Fanz Sdn Bhd 客服中心
 
 我们是一家拥有10年经验的马来西亚吊扇公司，产品通过 SIRIM 认证和 Suruhanjaya Tenaga 批准。
 
-请问您需要什么帮助？
-1️⃣ 产品咨询 — 了解我们的吊扇系列
-2️⃣ 报修/维修 — 预约上门维修
-3️⃣ 投诉与反馈 — 分享您的意见
+请问需要什么帮助？
+1. 产品咨询 — 了解我们的吊扇系列
+2. 报修/维修 — 预约上门维修
+3. 投诉与反馈 — 分享你的意见
 
-请在聊天框中直接告诉我您的问题，我会尽力协助您！如需人工客服，请随时告知。`,
+请在聊天框中直接告诉我你的问题，我会尽力协助你！如果需要人工客服，随时告知。`,
 
-    en: `Hello! Welcome to Fanz Sdn Bhd Customer Service 🏠
+    en: `Hello! Welcome to Fanz Sdn Bhd Customer Service
 
 We are a 10-year-experienced Malaysian ceiling fan company with SIRIM certification and Suruhanjaya Tenaga approval.
 
 How can I help you today?
-1️⃣ Product Inquiry — Learn about our ceiling fan series
-2️⃣ Repair / Maintenance — Schedule an on-site service
-3️⃣ Complaint & Feedback — Share your thoughts
+1. Product Inquiry — Learn about our ceiling fan series
+2. Repair / Maintenance — Schedule an on-site service
+3. Complaint & Feedback — Share your thoughts
 
 Just tell me your questions in the chat and I'll be happy to help! If you need a human agent, just let me know.`,
   };
@@ -422,8 +438,8 @@ bot.on("message", async (msg) => {
     // Parse marker from response
     const { clean, marker, data } = parseMarker(reply);
 
-    // Detect language from current user message for localized system messages
-    const lang = detectLang(text);
+    // Detect language from conversation history (not just current message)
+    const lang = detectLangFromHistory(chatId, text);
 
     // ── Process WORKORDER_READY marker ──────────────
     if (marker === "WORKORDER_READY" && data) {
@@ -454,7 +470,13 @@ bot.on("message", async (msg) => {
 
       // Build final message
       let finalMsg = clean;
-      if (warrantyMsg) finalMsg += "\n\n" + warrantyMsg + "\n\n" + tr("workorder_recorded", lang);
+      let recordedMsg = tr("workorder_recorded", lang);
+      if (warrantyMsg) {
+        finalMsg = (finalMsg ? finalMsg + "\n\n" : "") + warrantyMsg + "\n\n" + recordedMsg;
+      } else {
+        // No warranty info — just confirmation
+        finalMsg = finalMsg || recordedMsg;
+      }
 
       if (!inserted) {
         finalMsg += "\n\n" + tr("workorder_busy", lang);
