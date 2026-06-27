@@ -15,8 +15,8 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
-// Warranty rule: placeholder — 10 years from purchase date (to be confirmed by boss)
-const WARRANTY_YEARS = 10;
+// Warranty rules — real Fanz policy from lib/warranty.js
+const { calcWarrantyStatus, isWarrantyVoid } = require("./lib/warranty");
 
 if (!TELEGRAM_TOKEN || !OPENROUTER_API_KEY) {
   console.error("Missing TELEGRAM_TOKEN or OPENROUTER_API_KEY");
@@ -60,16 +60,17 @@ ${productLines}
 
 LINE A — Product Inquiry: Answer about models, features, suitable room size, differences. Use the product info above. Helpful but don't push sales.
 
-LINE B — Repair / Maintenance: Collect these FIVE things ONE AT A TIME. After each reply, immediately ask the next one — no delays, no checking, no waiting. Do NOT ask all five at once. Short confirm (1-3 words max) + next question only. Don't repeat what customer just said. Don't thank after every reply.
+LINE B — Repair / Maintenance: Collect these SIX things ONE AT A TIME. After each reply, immediately ask the next one — no delays, no checking, no waiting. Do NOT ask all six at once. Short confirm (1-3 words max) + next question only. Don't repeat what customer just said. Don't thank after every reply.
    Step 1 — Model / fan name
-   Step 2 — What's the problem
+   Step 2 — What's the problem  AND  Which part is having the issue（马达/Motor、接收器/Receiver、LED灯/LED、遥控器/Remote、要求上门服务/On-site service、其他/Other — pick one）
    Step 3 — Invoice number (just ask for it, no explanation)
    Step 4 — Address for service visit
    Step 5 — Preferred date and time
-After all 5 collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
+After all 6 collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
    **IMPORTANT — data output format**: On the LAST LINE of your response, output EXACTLY this format (no extra characters):
-   ||DATA||{"model":"[model]","issue":"[issue]","invoice":"[invoice]","address":"[address]","preferred_time":"[time]"}||END||[WORKORDER_READY]
-   Replace [bracketed] fields with what customer provided. If any field missing, use empty string. This line is internal, will be stripped before customer sees it.
+   ||DATA||{"model":"[model]","issue":"[issue]","issue_type":"[motor|receiver|led_plate|led_kit|onsite|unknown]","invoice":"[invoice]","address":"[address]","preferred_time":"[time]","country":"[MY|SG]"}||END||[WORKORDER_READY]
+   Replace [bracketed] fields with what customer provided. If any field missing, use empty string. issue_type should be one of: motor, receiver, led_plate, led_kit, onsite, unknown. country defaults to MY unless customer mentions Singapore.
+   This line is internal, will be stripped before customer sees it.
 
 LINE C — Complaint: Listen properly, acknowledge, say will pass to the relevant colleague. Don't argue, don't defend, don't over-apologize. Keep it short.
    **IMPORTANT — data output format**: When wrapping up, on the LAST LINE output:
@@ -174,15 +175,7 @@ async function lookupInvoice(invoiceNumber) {
   }
 }
 
-// Calculate warranty status from purchase date
-// Warranty rule: placeholder — 10 years from purchase date (to be confirmed by boss)
-function calcWarrantyStatus(purchaseDate) {
-  const purchased = new Date(purchaseDate);
-  const expires = new Date(purchased);
-  expires.setFullYear(expires.getFullYear() + WARRANTY_YEARS);
-  const now = new Date();
-  return now < expires ? "in_warranty" : "out_of_warranty";
-}
+// Calculate warranty status — DELEGATED to lib/warranty.js (see require at top)
 
 // Insert work order into Supabase
 async function insertWorkOrder(data, warrantyStatus) {
@@ -198,6 +191,8 @@ async function insertWorkOrder(data, warrantyStatus) {
         chat_id: data.chatId ? String(data.chatId) : "",
         model: data.model || "",
         issue: data.issue || "",
+        issue_type: data.issue_type || "",
+        country: data.country || "MY",
         invoice_number: data.invoice || "",
         warranty_status: warrantyStatus || "unknown",
         address: data.address || "",
@@ -296,14 +291,6 @@ function detectLangFromHistory(chatId, currentText) {
 }
 
 const TRANSLATIONS = {
-  warranty_in: {
-    en: ({ model, date }) => `✅ Your fan (${model}, purchased ${date}) is within the 10-year warranty period.`,
-    zh: ({ model, date }) => `✅ 你的风扇 (${model}，买于 ${date}) 还在 10 年保修期内。`,
-  },
-  warranty_out: {
-    en: ({ model, date }) => `⚠️ Your fan (${model}, purchased ${date}) is outside the 10-year warranty period. Our team will provide a service quotation.`,
-    zh: ({ model, date }) => `⚠️ 你的风扇 (${model}，买于 ${date}) 已经过了 10 年保修期。我们会再报维修费用给你。`,
-  },
   warranty_not_found: {
     en: "ℹ️ We could not find this invoice in our system. A colleague will manually verify your warranty status.",
     zh: "ℹ️ 找不到这个 invoice 号码。同事会帮你手动查一下保修。",
@@ -451,12 +438,54 @@ bot.on("message", async (msg) => {
       if (data.invoice) {
         const record = await lookupInvoice(data.invoice.trim());
         if (record) {
-          warrantyStatus = calcWarrantyStatus(record.purchase_date);
-          warrantyMsg = tr(
-            warrantyStatus === "in_warranty" ? "warranty_in" : "warranty_out",
-            lang,
-            { model: record.model, date: record.purchase_date }
+          const wResult = calcWarrantyStatus(
+            record.purchase_date,
+            data.issue_type || "unknown",
+            data.country || "MY"
           );
+          warrantyStatus = wResult.inWarranty ? "in_warranty" : "out_of_warranty";
+
+          // Build warranty message
+          const issueTypeMap = {
+            motor: "马达/Motor",
+            receiver: "接收器/Receiver",
+            led_plate: "LED板/LED Plate",
+            led_kit: "LED套件/LED Kit",
+            onsite: "上门服务/On-site",
+            unknown: "这个部件",
+          };
+          const issueLabel = issueTypeMap[data.issue_type] || "这个部件";
+          const warrantyPeriodText = `${wResult.warrantyPeriodYears}年`;
+
+          if (wResult.inWarranty) {
+            warrantyMsg = `✅ 你的风扇（型号 ${record.model}，购买日期 ${record.purchase_date}）的 **${issueLabel}** 还在 ${warrantyPeriodText} 保修期内。`;
+          } else {
+            const chargeText = wResult.chargeIfOver
+              ? `，过保收费约 ${wResult.chargeIfOver}`
+              : "";
+            warrantyMsg = `⚠️ 你的风扇（型号 ${record.model}，购买日期 ${record.purchase_date}）的 **${issueLabel}** 已经过了 ${warrantyPeriodText} 保修期${chargeText}。`;
+          }
+
+          // Add void check based on customer's issue description
+          if (data.issue) {
+            const voidCheck = isWarrantyVoid(data.issue);
+            if (voidCheck.mayBeVoid) {
+              warrantyMsg += `\n\n📌 请注意：如果你的问题属于 ${voidCheck.reason}，这类情况即使在保修期内也不在保修范围。师傅上门后会进一步确认具体情况。`;
+            }
+          }
+
+          // Add notes
+          if (wResult.notes && wResult.notes.length > 0) {
+            const noteLines = wResult.notes
+              .filter(n => !n.startsWith('保修从'))
+              .map(n => `• ${n}`);
+            if (noteLines.length > 0) {
+              warrantyMsg += `\n\n📌 ${noteLines.join("\n")}`;
+            }
+          }
+
+          // Complex warranty scenario disclaimer
+          warrantyMsg += `\n\n*以上是根据 invoice 记录的信息。具体情况以师傅上门后确认为准。*`;
         } else {
           warrantyMsg = tr("warranty_not_found", lang);
         }
@@ -467,7 +496,7 @@ bot.on("message", async (msg) => {
       const inserted = await insertWorkOrder(orderData, warrantyStatus);
 
       // Append to Google Sheet (non-blocking, log-only on failure)
-      appendToSheet([String(chatId), data.model, data.issue, data.invoice, warrantyStatus, data.address, data.preferredTime, new Date().toISOString()]);
+      appendToSheet([String(chatId), data.model, data.issue, data.issue_type, data.country || "MY", data.invoice, warrantyStatus, data.address, data.preferredTime, new Date().toISOString()]);
 
       // Build final message
       let finalMsg = clean;
