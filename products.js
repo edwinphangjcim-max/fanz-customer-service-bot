@@ -4,7 +4,7 @@
 const company = {
   name: "Fanz Sdn Bhd",
   yearsInBusiness: "10 years (Malaysia)",
-  warrantyNote: "Motor 10 years (start date & scope TBC by boss — warranty requires invoice)",
+  warrantyNote: "Motor 10 years, Receiver/LED 2 years, On-site service 1-2 years (by invoice year). Void for damage, pets, incorrect installation.",
   services: "Malaysia & Singapore on-site service",
   certifications: [
     "SIRIM certified",
