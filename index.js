@@ -15,10 +15,19 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
-// Warranty rules — real Fanz policy from lib/warranty.js
-const { calcWarrantyStatus, isWarrantyVoid } = require("./lib/warranty");
+// Warranty rules — real Fanz/Vioz policy from lib/warranty.js
+const { calcWarrantyStatus, isWarrantyVoid, inferBrand, POLICY_DISCLAIMER } = require("./lib/warranty");
 
-if (!TELEGRAM_TOKEN || !OPENROUTER_API_KEY) {
+// Deterministic guards — money red lines, trilingual detection, nudge, scripts.
+// The money rules are enforced HERE in code, not only in the prompt:
+// a drifting LLM cannot leak a discount/compensation reply past this layer.
+const { detectLang3, detectMoneyIntent, detectRepairIntent, isNudge, script } = require("./lib/guards");
+
+// Test hook: allow requiring this module (for the system prompt and helpers)
+// without starting the Telegram poller — same pattern as the marketing bot.
+const SKIP_BOT_INIT = process.env.SKIP_BOT_INIT === "1" || process.env.SKIP_PROMPT_ONLY === "1";
+
+if ((!TELEGRAM_TOKEN || !OPENROUTER_API_KEY) && !SKIP_BOT_INIT) {
   console.error("Missing TELEGRAM_TOKEN or OPENROUTER_API_KEY");
   process.exit(1);
 }
@@ -32,7 +41,9 @@ function buildSystemPrompt() {
     )
     .join("\n");
 
-  return `You are the customer service assistant for Fanz Sdn Bhd, a Malaysian ceiling fan company. Reply in the customer's language (Chinese or English). Keep every message short and natural, like a real person chatting on WhatsApp. Ask only one thing at a time.
+  return `You are Fann (Chinese: 小凡), the customer service assistant for Fanz Sdn Bhd, a Malaysian ceiling fan company. Reply in the customer's language (English, Chinese, or Bahasa Melayu). Keep every message short and natural, like a real person chatting on WhatsApp. Ask only one thing at a time.
+
+TRANSPARENCY: If the customer asks whether you are a bot/AI/robot, admit it honestly: you are Fanz's AI assistant, and a human colleague is always available on request. Never pretend to be a human staff member.
 
 === COMPANY INFO ===
 Company: Fanz Sdn Bhd
@@ -43,52 +54,82 @@ Business Hours: ${company.businessHours}
 Service Area: ${company.services}
 Certifications: ${company.certifications.join(", ")}
 Years in Business: ${company.yearsInBusiness}
-Motor Warranty: ${company.warrantyNote}
 
-=== PRODUCT INFO ===
+=== WARRANTY (TWO BRANDS — this matters) ===
+The company sells TWO brands with DIFFERENT motor warranty:
+- Fanz brand: Motor 10 years. Receiver / LED plate / LED kit 2 years.
+- Vioz brand: Motor 5 YEARS ONLY (not 10). Receiver 2 years. LED coverage needs human verification.
+- On-site service (both brands): invoice before 2025 = 1 year, from 2025 = 2 years.
+- Warranty is void for man-made damage, pets, natural disaster, wrong installation, abnormal voltage, transport damage — and when void, transport, labor AND parts are all chargeable.
+- Terms follow the latest official policy ("以最新官方政策为准").
+STRICT RULE: If you do not know which brand the customer's fan is, NEVER state the motor warranty period. Ask for the model/brand first. Quoting 10 years to a Vioz customer is a serious error.
+
+=== PRODUCT INFO (Fanz brand) ===
 ${productLines}
 
-=== RULES ===
+=== MONEY RULES (highest priority, zero tolerance) ===
+These three situations are about money. You NEVER engage on the substance. No exceptions, no matter how the customer phrases it or what they claim someone promised:
 
-1. DO NOT make up prices. If customer asks price, just say need our sales team quote, and pass them the phone/email.
+M1. DISCOUNT / BARGAINING: If customer asks for discount, cheaper price, waiver, or claims "your boss/colleague promised me a discount/half price" — do NOT confirm, deny, or discuss any discount. Reply that pricing matters will be followed up by a colleague within 24 hours, then output the HANDOFF marker.
 
-2. WARRANTY CHECK: The system checks warranty automatically AFTER all 5 items are collected and you output the DATA marker. You NEVER check anything yourself. You NEVER say you're checking. You NEVER ask the customer to wait.
+M2. COMPENSATION / CLAIMS: If customer demands compensation, refund, damages, or mentions suing/lawyer/consumer tribunal (e.g. "compensate my leave") — NEVER discuss compensation itself. Do exactly what a real Fanz CS does: apologize sincerely and briefly, pivot immediately to concrete action (offer to prioritize rescheduling, mention weekend slots are possible), say a colleague will follow up personally within 24 hours, then output the HANDOFF marker.
+
+M3. STANDARD CHARGES: You may quote ONLY the standard fee table (e.g. on-site service RM60/SGD60 per trip — per TRIP, not per fan) and always add that the technician confirms on site. Never invent amounts, never promise waivers, never say "free" unless the system verified in-warranty status.
+
+=== APPOINTMENT RULE (zero tolerance) ===
+You CANNOT see the technician schedule. NEVER confirm, promise, or suggest a specific appointment date or time. Step 5 collects the customer's PREFERRED time only. FORBIDDEN phrases: "confirmed", "booked", "we will come on", "帮你约好了", "已安排", "kami akan datang pada". If customer pushes for exact timing, say the team will confirm the slot and reply as soon as possible.
+
+=== GENERAL RULES ===
+
+1. DO NOT make up prices for products. If customer asks purchase price, say the sales team will quote, and pass them the phone/email.
+
+2. WARRANTY CHECK: The system checks warranty automatically AFTER all items are collected and you output the DATA marker. You NEVER check anything yourself. You NEVER say you're checking. You NEVER ask the customer to wait.
    STRICTLY FORBIDDEN: Never say "let me check", "checking", "one moment", "please wait", "查询中", "稍等", "让我查一下" or any variation.
-   Your ONLY job regarding warranty: ask for the invoice number in Step 3, note it down, and move to Step 4. That's it.
+   NEVER state a warranty verdict (in warranty / out of warranty / how much it will cost) yourself. Only the system message after the marker does that.
 
 3. There are THREE service lines. Figure out which one from customer's message:
 
 LINE A — Product Inquiry: Answer about models, features, suitable room size, differences. Use the product info above. Helpful but don't push sales.
 
-LINE B — Repair / Maintenance: Collect these SIX things ONE AT A TIME. After each reply, immediately ask the next one — no delays, no checking, no waiting. Do NOT ask all six at once. Short confirm (1-3 words max) + next question only. Don't repeat what customer just said. Don't thank after every reply.
-   Step 1 — Model / fan name
+LINE B — Repair / Maintenance: Collect these items ONE AT A TIME. After each reply, immediately ask the next one — no delays, no checking, no waiting. Do NOT ask all at once. Short confirm (1-3 words max) + next question only. Don't repeat what customer just said. Don't thank after every reply.
+   Step 1 — Model / fan name (also determines brand: Fanz or Vioz; if unclear from model, ask which brand)
    Step 2 — What's the problem  AND  Which part is having the issue（马达/Motor、接收器/Receiver、LED灯/LED、遥控器/Remote、要求上门服务/On-site service、其他/Other — pick one）
-   Step 3 — Invoice number (just ask for it, no explanation)
+   Step 3 — Invoice number OR a photo of the invoice (dealer invoices are fine too). If the customer already sent an invoice photo, note it and move on — do not ask again.
    Step 4 — Address for service visit
-   Step 5 — Preferred date and time
-After all 6 collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
+   Step 5 — PREFERRED date and time (preference only — see APPOINTMENT RULE)
+After all collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
    **IMPORTANT — data output format**: On the LAST LINE of your response, output EXACTLY this format (no extra characters):
-   ||DATA||{"model":"[model]","issue":"[issue]","issue_type":"[motor|receiver|led_plate|led_kit|onsite|unknown]","invoice":"[invoice]","address":"[address]","preferred_time":"[time]","country":"[MY|SG]"}||END||[WORKORDER_READY]
-   Replace [bracketed] fields with what customer provided. If any field missing, use empty string. issue_type should be one of: motor, receiver, led_plate, led_kit, onsite, unknown. country defaults to MY unless customer mentions Singapore.
+   ||DATA||{"model":"[model]","brand":"[fanz|vioz|unknown]","issue":"[issue]","issue_type":"[motor|receiver|led_plate|led_kit|onsite|unknown]","invoice":"[invoice number, or 'photo' if customer sent invoice photo]","address":"[address]","preferred_time":"[time]","country":"[MY|SG]","has_media":[true|false]}||END||[WORKORDER_READY]
+   Replace [bracketed] fields with what customer provided. If any field missing, use empty string. brand: infer from model if possible, else "unknown". has_media: true if customer sent any photo/video during this conversation. country defaults to MY unless customer mentions Singapore.
    This line is internal, will be stripped before customer sees it.
 
 LINE C — Complaint: Listen properly, acknowledge, say will pass to the relevant colleague. Don't argue, don't defend, don't over-apologize. Keep it short.
    **IMPORTANT — data output format**: When wrapping up, on the LAST LINE output:
    ||DATA||{"category":"product|installation|logistics|other","content":"[summary of complaint]"}||END||[COMPLAINT_READY]
 
-4. HANDOFF TO HUMAN: If customer angry, asking something you can't handle, or wants human, reply (Chinese): "了解，我帮你转给同事跟进。麻烦留个联络号码，24小时内有人联系你。" / (English): "Noted, let me pass you to a human colleague. Drop your contact number, someone will reach out within 24 hours."
+4. HANDOFF TO HUMAN: If customer angry, asking something you can't handle, wants a human, or a MONEY RULE triggered — give a short reply per the rules above, then on the LAST LINE output:
+   ||DATA||{"reason":"[discount|compensation|angry|request_human|other]","summary":"[one-line summary]"}||END||[HANDOFF_READY]
+   Handoff reply style — (Chinese): "了解，我帮你转给同事跟进哦，24小时内有人联系你。" (English): "Noted, let me pass you to my colleague to follow up ya, someone will contact you within 24 hours." (Malay): "Baik, saya akan pass kepada colleague untuk follow up ya, mereka akan hubungi awak dalam 24 jam."
 
-5. LANGUAGE: Match customer's language. If they mix Chinese and English (rojak style), you can mix naturally too. Chinese style: Malaysian Chinese, casual WhatsApp tone — short sentences, no mainland Chinese officialese ("请您"、"为您服务"、"亲"). Use natural words like 师傅, 上门, 联络, 报修, 麻烦, 帮你看下, 没问题, 好的, 收到. English style: short, plain Malaysian business English. No flowery phrases.
+5. LANGUAGE: Match customer's language across English / Chinese / Bahasa Melayu. If they mix languages (rojak style), you can mix naturally too.
+   - Chinese style: Malaysian Chinese, casual WhatsApp tone — short sentences, no mainland officialese ("请您"、"为您服务"、"亲"). Natural words: 师傅, 上门, 联络, 报修, 麻烦, 帮你看下, 没问题, 好的, 收到.
+   - English style: short, plain Malaysian/Singaporean business English. Sentence-final "ya" is natural ("sorry ya", "let us know ya"). No flowery phrases.
+   - Malay style: colloquial BM as spoken in Johor — "boleh", "kami arrange", mixed English nouns (technician, appointment, service) are natural. Understand common shorthand: x = tak, dtg = datang, skang/skrg = sekarang, bleh = boleh, jgn = jangan, sampi = sampai.
+   - Customers often send several very short messages in a row and use typos — read them together and respond to the intent, not word by word.
 
 6. PERSONALITY:
+   - You are Fann (小凡). Warm, brief, helpful — like the real Fanz service desk.
    - Short, direct, friendly. One question at a time.
    - No emoji in any response. Not in text, not in option lists.
    - When listing options, use plain "1." "2." "3." (NOT 1️⃣ 2️⃣ 3️⃣).
    - Don't repeat what customer just said back to them.
    - Don't thank customer in every message. Once is enough.
    - No long preambles. Get to the point.
+   - Apology pattern (real Fanz style): short apology + reason + immediately offer the next step. Never grovel.
 
-7. If not sure about something, just say so and offer to pass to human team.`;
+7. If a message is just "?" or "any update" — the customer is chasing progress. Apologize briefly and say you will chase the team, do not treat it as a new topic.
+
+8. If not sure about something, just say so and offer to pass to human team.`;
 }
 
 const SYSTEM_PROMPT = buildSystemPrompt();
@@ -104,6 +145,7 @@ function getHistory(chatId) {
 }
 
 function appendHistory(chatId, role, content) {
+  lastActive.set(chatId, Date.now());
   if (!conversations.has(chatId)) {
     conversations.set(chatId, []);
   }
@@ -177,38 +219,126 @@ async function lookupInvoice(invoiceNumber) {
 
 // Calculate warranty status — DELEGATED to lib/warranty.js (see require at top)
 
-// Insert work order into Supabase
+// Insert work order into Supabase.
+// brand/has_media are new columns (migration may not have run yet) —
+// on an unknown-column error, retry once without them so intake never breaks.
 async function insertWorkOrder(data, warrantyStatus) {
   if (!SUPABASE_SERVICE_KEY) {
     console.warn("SUPABASE_SERVICE_KEY not set — skipping work order insert");
     return false;
   }
-  try {
+  const base = {
+    chat_id: data.chatId ? String(data.chatId) : "",
+    model: data.model || "",
+    issue: data.issue || "",
+    issue_type: data.issue_type || "",
+    country: data.country || "MY",
+    invoice_number: data.invoice || "",
+    warranty_status: warrantyStatus || "unknown",
+    address: data.address || "",
+    preferred_time: data.preferredTime || data.preferred_time || "",
+    status: "new",
+  };
+  const extended = {
+    ...base,
+    brand: data.brand || "unknown",
+    has_media: Boolean(data.has_media),
+  };
+
+  async function tryInsert(payload) {
     const resp = await fetch(`${SUPABASE_URL}/rest/v1/work_orders`, {
       method: "POST",
       headers: SUPABASE_HEADERS,
-      body: JSON.stringify({
-        chat_id: data.chatId ? String(data.chatId) : "",
-        model: data.model || "",
-        issue: data.issue || "",
-        issue_type: data.issue_type || "",
-        country: data.country || "MY",
-        invoice_number: data.invoice || "",
-        warranty_status: warrantyStatus || "unknown",
-        address: data.address || "",
-        preferred_time: data.preferredTime || "",
-        status: "new",
-      }),
+      body: JSON.stringify(payload),
     });
-    if (!resp.ok) {
-      const errText = await resp.text();
-      console.error(`Supabase insertWorkOrder failed (${resp.status}):`, errText);
+    if (resp.ok) return { ok: true };
+    return { ok: false, status: resp.status, text: await resp.text() };
+  }
+
+  try {
+    let r = await tryInsert(extended);
+    if (!r.ok && /column|PGRST204|42703/i.test(r.text || "")) {
+      console.warn("insertWorkOrder: new columns missing, retrying legacy payload (run the ALTER TABLE migration)");
+      r = await tryInsert(base);
+    }
+    if (!r.ok) {
+      console.error(`Supabase insertWorkOrder failed (${r.status}):`, r.text);
       return false;
     }
     return true;
   } catch (err) {
     console.error("Supabase insertWorkOrder error:", err.message);
     return false;
+  }
+}
+
+// ── Escalations (money red lines / handoff) ───────
+// complaints.category has a DB CHECK that rejects new values (probed 23514),
+// so escalations reuse category 'other' with a typed prefix in content.
+async function insertEscalation(chatId, reason, summary) {
+  const content = `[ESCALATION:${reason}] ${summary || ""}`.trim();
+  return insertComplaint(chatId, "other", content);
+}
+
+// ── Unpaid gate ───────────────────────────────────
+// work_orders.payment_status is maintained manually by staff (batch 1).
+// Cache per chat for 10 minutes to avoid a query on every message.
+const unpaidCache = new Map(); // chatId -> { unpaid: boolean, at: ms }
+const UNPAID_CACHE_MS = 10 * 60_000;
+
+async function hasUnpaidOrder(chatId) {
+  if (!SUPABASE_SERVICE_KEY) return false;
+  const cached = unpaidCache.get(chatId);
+  if (cached && Date.now() - cached.at < UNPAID_CACHE_MS) return cached.unpaid;
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/work_orders?chat_id=eq.${encodeURIComponent(String(chatId))}&payment_status=eq.unpaid&select=id&limit=1`;
+    const resp = await fetch(url, { headers: SUPABASE_HEADERS });
+    if (!resp.ok) {
+      // Column may not exist yet (pre-migration) — treat as no unpaid, log once
+      console.warn(`[unpaidGate] query failed ${resp.status} — gate inactive`);
+      unpaidCache.set(chatId, { unpaid: false, at: Date.now() });
+      return false;
+    }
+    const rows = await resp.json();
+    const unpaid = Array.isArray(rows) && rows.length > 0;
+    unpaidCache.set(chatId, { unpaid, at: Date.now() });
+    return unpaid;
+  } catch (err) {
+    console.error("[unpaidGate] error:", err.message);
+    return false;
+  }
+}
+
+// ── Media tracking ────────────────────────────────
+// Customers open with photos/videos/voice constantly (all real chats did).
+// Track per chat so the work order carries has_media.
+const mediaSeen = new Map(); // chatId -> true
+
+// ── Guard debounce state ──────────────────────────
+// Unpaid gate fires ONCE per chat (first repair mention) — re-triggering on
+// every keyword hit would derail a live intake ("receiver problem" is an
+// intake ANSWER, not a new repair request). Human follows up after the first.
+const unpaidGateFired = new Map(); // chatId -> ms
+// Nudges escalate at most once per cooldown; the customer still gets the
+// chase script every time, but the human queue is not spammed.
+const nudgeEscalatedAt = new Map(); // chatId -> ms
+const NUDGE_ESCALATION_COOLDOWN_MS = 30 * 60_000;
+
+// ── Idle-state sweep ──────────────────────────────
+// All per-chat Maps otherwise grow forever in a long-running process.
+const lastActive = new Map(); // chatId -> ms
+const IDLE_EVICT_MS = 24 * 3600_000;
+function sweepIdleState() {
+  const cutoff = Date.now() - IDLE_EVICT_MS;
+  for (const [id, at] of lastActive) {
+    if (at < cutoff) {
+      lastActive.delete(id);
+      conversations.delete(id);
+      mediaSeen.delete(id);
+      unpaidCache.delete(id);
+      unpaidGateFired.delete(id);
+      nudgeEscalatedAt.delete(id);
+    }
   }
 }
 
@@ -270,20 +400,22 @@ async function appendToSheet(rowData) {
 }
 
 // ── Localization ──────────────────────────────────
+// Trilingual (zh/en/ms) — detection delegated to lib/guards.js detectLang3.
 function detectLang(text) {
-  return /[一-鿿]/.test(text || "") ? "zh" : "en";
+  return detectLang3(text);
 }
 
-// Detect language from conversation history (last 3 user messages + current text)
+// Detect language from conversation history (last 3 user messages + current text).
+// Current text wins if it has a clear signal (zh or ms); otherwise look back.
 function detectLangFromHistory(chatId, currentText) {
-  // Check current text first
-  if (detectLang(currentText) === "zh") return "zh";
-  // Check last 3 user messages in history
+  const current = detectLang3(currentText);
+  if (current === "zh" || current === "ms") return current;
   const history = getHistory(chatId);
   let checked = 0;
   for (let i = history.length - 1; i >= 0 && checked < 3; i--) {
     if (history[i].role === "user") {
-      if (detectLang(history[i].content) === "zh") return "zh";
+      const l = detectLang3(history[i].content);
+      if (l === "zh" || l === "ms") return l;
       checked++;
     }
   }
@@ -294,27 +426,46 @@ const TRANSLATIONS = {
   warranty_not_found: {
     en: "ℹ️ We could not find this invoice in our system. A colleague will manually verify your warranty status.",
     zh: "ℹ️ 找不到这个 invoice 号码。同事会帮你手动查一下保修。",
+    ms: "ℹ️ Kami tidak jumpa invoice ini dalam sistem. Colleague kami akan verify status warranty awak secara manual.",
+  },
+  warranty_photo: {
+    en: "ℹ️ We received your invoice photo. A colleague will verify your warranty status from it.",
+    zh: "ℹ️ 收到你的 invoice 照片了。同事会根据照片帮你核实保修。",
+    ms: "ℹ️ Kami dah terima gambar invoice awak. Colleague kami akan verify status warranty daripada gambar tu.",
   },
   workorder_recorded: {
-    en: "✅ Your repair request has been recorded. Our technician will contact you to arrange the visit.",
-    zh: "✅ 维修申请已收到。师傅会联络你安排上门。",
+    en: "✅ Your repair request has been recorded. Our team will contact you to confirm the appointment slot.",
+    zh: "✅ 维修申请已收到。同事会联络你确认上门时间。",
+    ms: "✅ Permintaan repair awak dah direkodkan. Team kami akan hubungi awak untuk confirm masa appointment.",
   },
   workorder_busy: {
     en: "⚠️ System is temporarily busy. Your request has been forwarded to our human team who will follow up with you. Thank you for your patience.",
     zh: "⚠️ 系统暂时 busy。你的申请已转给同事跟进，他们会联络你。",
+    ms: "⚠️ Sistem sibuk buat masa ini. Permintaan awak dah dihantar kepada team kami, mereka akan follow up dengan awak. Terima kasih.",
   },
   complaint_busy: {
     en: "⚠️ System is temporarily busy. Your feedback has been forwarded to our human team who will personally follow up with you.",
     zh: "⚠️ 系统暂时 busy。你的反馈已转给同事亲自跟进。",
+    ms: "⚠️ Sistem sibuk buat masa ini. Maklum balas awak dah dihantar kepada team kami untuk follow up.",
+  },
+  handoff_recorded: {
+    en: "Your request has been passed to our colleague, someone will contact you within 24 hours.",
+    zh: "已经转给同事跟进，24小时内会有人联络你。",
+    ms: "Permintaan awak dah dipass kepada colleague kami, mereka akan hubungi awak dalam 24 jam.",
   },
   error_connect: {
     en: "Sorry, I'm having trouble connecting right now. Please try again later.",
     zh: "抱歉，我暂时连不上，请稍后再试。",
+    ms: "Maaf, sistem ada masalah sambungan sekarang. Cuba lagi sebentar ya.",
   },
 };
 
 function tr(key, lang, params) {
   const entry = TRANSLATIONS[key];
+  if (!entry) {
+    console.error(`tr(): unknown translation key "${key}"`);
+    return "";
+  }
   const value = entry[lang] || entry.en;
   return typeof value === "function" ? value(params || {}) : value;
 }
@@ -342,7 +493,7 @@ function parseMarker(reply) {
 // ── Welcome Message ──────────────────────────────
 function buildWelcome() {
   return {
-    zh: `你好！欢迎来到 Fanz Sdn Bhd 客服中心
+    zh: `你好！我是小凡，Fanz Sdn Bhd 的客服助手
 
 我们是一家拥有10年经验的马来西亚吊扇公司，产品通过 SIRIM 认证和 Suruhanjaya Tenaga 批准。
 
@@ -351,36 +502,55 @@ function buildWelcome() {
 2. 报修/维修 — 预约上门维修
 3. 投诉与反馈 — 分享你的意见
 
-请在聊天框中直接告诉我你的问题，我会尽力协助你！如果需要人工客服，随时告知。`,
+直接在聊天框告诉我你的问题就行。需要人工客服，随时讲一声。`,
 
-    en: `Hello! Welcome to Fanz Sdn Bhd Customer Service
+    en: `Hello! I'm Fann, the customer service assistant for Fanz Sdn Bhd
 
 We are a 10-year-experienced Malaysian ceiling fan company with SIRIM certification and Suruhanjaya Tenaga approval.
 
 How can I help you today?
 1. Product Inquiry — Learn about our ceiling fan series
-2. Repair / Maintenance — Schedule an on-site service
+2. Repair / Maintenance — Arrange an on-site service
 3. Complaint & Feedback — Share your thoughts
 
-Just tell me your questions in the chat and I'll be happy to help! If you need a human agent, just let me know.`,
+Just tell me your questions in the chat. If you need a human agent, just let me know.`,
+
+    ms: `Hi! Saya Fann, pembantu khidmat pelanggan Fanz Sdn Bhd
+
+Kami syarikat kipas siling Malaysia dengan 10 tahun pengalaman, produk disahkan SIRIM dan diluluskan Suruhanjaya Tenaga.
+
+Macam mana saya boleh tolong?
+1. Pertanyaan produk — kenali siri kipas kami
+2. Repair / servis — arrange technician datang rumah
+3. Aduan & maklum balas — kongsi pendapat awak
+
+Terus taip masalah awak kat sini ya. Kalau nak cakap dengan orang, bagitahu je.`,
   };
 }
 
 // ── Bot Setup ────────────────────────────────────
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+// Under SKIP_BOT_INIT, a no-op proxy lets tests require this module without polling.
+const bot = SKIP_BOT_INIT
+  ? new Proxy({}, { get: () => () => Promise.resolve() })
+  : new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-console.log("Fanz Customer Service Bot starting... (polling mode)");
+if (!SKIP_BOT_INIT) {
+  console.log("Fanz Customer Service Bot starting... (polling mode)");
+  // Hourly sweep of idle per-chat state (see sweepIdleState)
+  setInterval(sweepIdleState, 3600_000);
+}
 
 // ── /start command ───────────────────────────────
 bot.onText(/^\/start/, (msg) => {
   const chatId = msg.chat.id;
   clearHistory(chatId);
 
-  const text = msg.text || "";
-  // if user sent "/start en", show English only
-  const wantsEnglish = text.toLowerCase().includes(" en");
-  if (wantsEnglish) {
+  const text = (msg.text || "").toLowerCase();
+  // "/start en" → English, "/start ms" → Malay, default Chinese
+  if (text.includes(" en")) {
     bot.sendMessage(chatId, buildWelcome().en);
+  } else if (text.includes(" ms") || text.includes(" bm")) {
+    bot.sendMessage(chatId, buildWelcome().ms);
   } else {
     bot.sendMessage(chatId, buildWelcome().zh);
   }
@@ -393,6 +563,15 @@ bot.onText(/\/clear/, (msg) => {
   bot.sendMessage(chatId, "Conversation history cleared. / 对话记录已清除。");
 });
 
+// ── Media classification (platform-thin, ports to WhatsApp later) ──
+function classifyMedia(msg) {
+  if (msg.photo && msg.photo.length) return "photo";
+  if (msg.video || msg.video_note) return "video";
+  if (msg.voice || msg.audio) return "voice";
+  if (msg.document || msg.sticker) return "other";
+  return null;
+}
+
 // ── Message Handler ──────────────────────────────
 bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
@@ -401,11 +580,74 @@ bot.on("message", async (msg) => {
   // Skip commands handled above
   if (text.startsWith("/")) return;
 
+  // ── R1: non-text messages — acknowledge, guide, remember ──
+  // Every real customer chat opened with a photo/video/voice. Silence here
+  // is the single worst first impression the bot can make.
+  const mediaType = classifyMedia(msg);
+  if (!text && mediaType) {
+    const lang = detectLangFromHistory(chatId, msg.caption || "");
+    mediaSeen.set(chatId, true);
+    // Annotate history so the LLM knows evidence exists and intake can skip re-asking
+    const label = { photo: "photo", video: "video", voice: "voice message", other: "file" }[mediaType];
+    appendHistory(chatId, "user", `[customer sent a ${label}${msg.caption ? `, caption: "${msg.caption}"` : ""}]`);
+    await sendWithSplit(chatId, script(`media_${mediaType}`, lang));
+    return;
+  }
+
   // Ignore empty messages
   if (!text) return;
 
   // Show typing indicator
   bot.sendChatAction(chatId, "typing");
+
+  const langNow = detectLangFromHistory(chatId, text);
+
+  // ── MONEY RED LINES — deterministic code layer, runs BEFORE the LLM ──
+  // Discount/bargaining and compensation/claims are never left to the
+  // model's judgement: fixed script + escalation record, conversation over.
+  const moneyIntent = detectMoneyIntent(text);
+  if (moneyIntent) {
+    appendHistory(chatId, "user", text);
+    const reply = script(moneyIntent, langNow);
+    // History gets a compact annotation instead of the full script, so a
+    // mid-intake LLM knows the topic was escalated and CONTINUES the intake
+    // rather than treating the fixed script as its own conversational turn.
+    appendHistory(chatId, "assistant",
+      `[system note: the ${moneyIntent} topic was escalated to a human colleague and the customer was informed. Continue helping with the fan issue from where the conversation left off.]`);
+    await sendWithSplit(chatId, reply);
+    await insertEscalation(chatId, moneyIntent, text.slice(0, 300));
+    return;
+  }
+
+  // ── UNPAID GATE — outstanding payment + new repair request ──
+  // Real CS rule: settle previous payment first, then new appointment.
+  // Fires ONCE per chat: "receiver problem" mid-intake is an answer, not a
+  // new repair request — re-triggering would derail the flow.
+  if (!unpaidGateFired.has(chatId) && detectRepairIntent(text) && (await hasUnpaidOrder(chatId))) {
+    unpaidGateFired.set(chatId, Date.now());
+    appendHistory(chatId, "user", text);
+    appendHistory(chatId, "assistant",
+      "[system note: customer has an outstanding payment; they were asked to settle it first and a colleague will follow up. Do not arrange a new appointment; you may still answer product questions.]");
+    await sendWithSplit(chatId, script("unpaid", langNow));
+    await insertEscalation(chatId, "unpaid_repair_request", text.slice(0, 300));
+    return;
+  }
+
+  // ── NUDGE — bare "?" / "any update" means "chase progress" ──
+  if (isNudge(text) && getHistory(chatId).length > 0) {
+    appendHistory(chatId, "user", text);
+    const reply = script("nudge", langNow);
+    appendHistory(chatId, "assistant", reply);
+    await sendWithSplit(chatId, reply);
+    // Escalate at most once per cooldown — five "?" in a row is one chase,
+    // not five complaint rows.
+    const lastEsc = nudgeEscalatedAt.get(chatId) || 0;
+    if (Date.now() - lastEsc > NUDGE_ESCALATION_COOLDOWN_MS) {
+      nudgeEscalatedAt.set(chatId, Date.now());
+      await insertEscalation(chatId, "customer_chasing", "customer nudged for progress");
+    }
+    return;
+  }
 
   try {
     // Build message array: system + history + current message
@@ -434,16 +676,32 @@ bot.on("message", async (msg) => {
       let warrantyMsg = "";
       let warrantyStatus = "unknown";
 
+      // Resolve brand: marker value first, then model inference. If still
+      // unknown, calcWarrantyStatus refuses brand-sensitive verdicts (R6).
+      let brand = (data.brand || "").toLowerCase();
+      if (brand !== "fanz" && brand !== "vioz") {
+        brand = inferBrand(data.model);
+      }
+      data.brand = brand;
+      data.has_media = Boolean(data.has_media) || mediaSeen.get(chatId) === true;
+
+      // Invoice photo path — dealer invoices are valid evidence but are not
+      // in our sales_records; human verifies from the photo. No DB verdict.
+      const invoiceIsPhoto = /^photo$/i.test((data.invoice || "").trim());
+
       // Look up invoice for warranty check
-      if (data.invoice) {
+      if (data.invoice && !invoiceIsPhoto) {
         const record = await lookupInvoice(data.invoice.trim());
         if (record) {
           const wResult = calcWarrantyStatus(
             record.purchase_date,
             data.issue_type || "unknown",
-            data.country || "MY"
+            data.country || "MY",
+            brand
           );
-          warrantyStatus = wResult.inWarranty ? "in_warranty" : "out_of_warranty";
+          warrantyStatus = wResult.needsBrand
+            ? "unknown"
+            : wResult.inWarranty ? "in_warranty" : "out_of_warranty";
 
           // Build warranty message
           const issueTypeMap = {
@@ -457,7 +715,11 @@ bot.on("message", async (msg) => {
           const issueLabel = issueTypeMap[data.issue_type] || "这个部件";
           const warrantyPeriodText = `${wResult.warrantyPeriodYears}年`;
 
-          if (wResult.inWarranty) {
+          if (wResult.needsBrand) {
+            // Brand unknown + brand-sensitive part: NO verdict (Fanz motor
+            // 10y vs Vioz 5y — guessing wrong is a money-consequence error)
+            warrantyMsg = `ℹ️ 你的风扇（型号 ${record.model}，购买日期 ${record.purchase_date}）需要先确认品牌（Fanz 或 Vioz）才能判断保修——两个品牌的保修期不同。同事会根据 invoice 帮你核实。`;
+          } else if (wResult.inWarranty) {
             warrantyMsg = `✅ 你的风扇（型号 ${record.model}，购买日期 ${record.purchase_date}）的 **${issueLabel}** 还在 ${warrantyPeriodText} 保修期内。`;
           } else {
             const chargeText = wResult.chargeIfOver
@@ -484,11 +746,15 @@ bot.on("message", async (msg) => {
             }
           }
 
-          // Complex warranty scenario disclaimer
-          warrantyMsg += `\n\n*以上是根据 invoice 记录的信息。具体情况以师傅上门后确认为准。*`;
+          // Policy disclaimer (latest official policy + technician confirms)
+          warrantyMsg += `\n\n*以上是根据 invoice 记录的信息。${POLICY_DISCLAIMER}*`;
         } else {
           warrantyMsg = tr("warranty_not_found", lang);
         }
+      } else if (invoiceIsPhoto) {
+        // Customer provided invoice as a photo (e.g. dealer invoice) —
+        // human verifies, no automatic verdict
+        warrantyMsg = tr("warranty_photo", lang);
       }
 
       // Insert work order into Supabase
@@ -496,7 +762,7 @@ bot.on("message", async (msg) => {
       const inserted = await insertWorkOrder(orderData, warrantyStatus);
 
       // Append to Google Sheet (non-blocking, log-only on failure)
-      appendToSheet([String(chatId), data.model, data.issue, data.issue_type, data.country || "MY", data.invoice, warrantyStatus, data.address, data.preferredTime, new Date().toISOString()]);
+      appendToSheet([String(chatId), data.model, data.issue, data.issue_type, data.country || "MY", data.invoice, warrantyStatus, data.address, data.preferred_time || data.preferredTime || "", new Date().toISOString()]);
 
       // Build final message
       let finalMsg = clean;
@@ -526,6 +792,14 @@ bot.on("message", async (msg) => {
         finalMsg += "\n\n" + tr("complaint_busy", lang);
       }
 
+      await sendWithSplit(chatId, finalMsg);
+      return;
+    }
+
+    // ── Process HANDOFF_READY marker (LLM-initiated escalation) ──
+    if (marker === "HANDOFF_READY" && data) {
+      await insertEscalation(chatId, data.reason || "other", data.summary || "");
+      const finalMsg = clean || tr("handoff_recorded", lang);
       await sendWithSplit(chatId, finalMsg);
       return;
     }
@@ -575,3 +849,12 @@ process.on("SIGTERM", () => {
   bot.stopPolling();
   process.exit(0);
 });
+
+// ── Exports (tests) ──────────────────────────────
+module.exports = {
+  buildSystemPromptForTest: buildSystemPrompt,
+  parseMarker,
+  detectLangFromHistory,
+  insertWorkOrder,
+  classifyMedia,
+};
