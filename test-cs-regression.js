@@ -65,6 +65,12 @@ function tier0() {
 
   // 品牌感知（R6 的机器侧）
   t(inferBrand("some-unknown-model-xyz") === "unknown", "brand: unmapped model -> unknown");
+  // 发票映射启用后：真实型号能判品牌（provisional，待 Fanz 确认）
+  t(inferBrand("FS 563L") === "fanz", "brand: FS -> fanz");
+  t(inferBrand("Grande 523") === "fanz", "brand: Grande -> fanz");
+  t(inferBrand("V605") === "fanz", "brand: V605 -> fanz (not vioz)");
+  t(inferBrand("VIOZ WINDY MK II") === "vioz", "brand: Vioz Windy -> vioz");
+  t(inferBrand("FANZ-VIOZ CF16") === "vioz", "brand: Fanz-Vioz CF16 -> vioz");
   const w = calcWarrantyStatus("2024-01-01", "motor", "MY", "unknown");
   t(w.needsBrand === true, "warranty: unknown brand + motor -> needsBrand, no verdict");
   const wv = calcWarrantyStatus("2020-01-01", "motor", "MY", "vioz");
