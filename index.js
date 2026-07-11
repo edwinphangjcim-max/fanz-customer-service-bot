@@ -633,39 +633,51 @@ function buildInvoiceEcho(inv, lang) {
   // to the human handoff via the history annotation.
   const label = (l) => {
     const fam = l.family || (l.modelText || "").slice(0, 28);
-    const withBrand = /vioz|fanz/i.test(fam) ? fam : `${l.brand === "vioz" ? "Vioz" : "Fanz"} ${fam}`;
+    // Only prefix a brand we actually resolved. An unknown-brand line must NOT
+    // be asserted to the customer as "Fanz" — say the model text plainly and let
+    // the human verify the brand.
+    const prefix = l.brand === "vioz" ? "Vioz " : l.brand === "fanz" ? "Fanz " : "";
+    const withBrand = /vioz|fanz/i.test(fam) ? fam : `${prefix}${fam}`;
     return `${withBrand}${l.size ? " " + l.size : ""}`.trim();
   };
   const models = [...new Set(inv.fanzLines.map(label).filter(Boolean))].slice(0, 3).join(", ") || "-";
   const dateShown = inv.purchaseDateIso || inv.purchaseDateRaw || "";
   const multi = inv.multipleFans;
+  // When the document reads as a delivery order / receipt / quote rather than a
+  // tax invoice, still echo (customers do send these as proof) but flag it so
+  // the customer knows the human may ask for the actual purchase invoice. The
+  // echo never decides warranty, so this stays safe.
+  const notInvoice = inv.isInvoice === false;
   // ALWAYS ask the customer to confirm the date. A confident-but-wrong date
   // (DD/MM vs MM/DD, 2-digit year) is the highest-consequence silent error for
   // warranty — don't rely on the model self-reporting ambiguity.
 
   if (lang === "zh") {
-    let m = `收到发票啦 ✅ 我这边读到：${models}`;
+    let m = `收到啦 ✅ 我这边读到：${models}`;
     m += dateShown ? `，购买日期 ${dateShown}` : "";
     m += "。";
     m += dateShown ? `麻烦你确认一下购买日期对不对哦？` : `购买日期我看不太清，可以打一下购买日期吗？`;
     if (multi) m += ` 这张单有几款风扇，请问是哪一款出问题？`;
+    if (notInvoice) m += ` （这看起来像送货单/收据，不是正式发票——同事会再帮你确认购买凭证。）`;
     m += ` 同事会根据这个帮你核实保修状态。`;
     return m;
   }
   if (lang === "ms") {
-    let m = `Dah terima invoice awak ✅ Saya baca: ${models}`;
+    let m = `Dah terima ✅ Saya baca: ${models}`;
     m += dateShown ? `, tarikh beli ${dateShown}` : "";
     m += ".";
     m += dateShown ? ` Boleh confirm tarikh beli tu betul tak?` : ` Tarikh beli tak berapa jelas, boleh taip tarikh beli awak?`;
-    if (multi) m += ` Invoice ni ada beberapa kipas — yang mana satu ada masalah ya?`;
+    if (multi) m += ` Ada beberapa kipas kat sini — yang mana satu ada masalah ya?`;
+    if (notInvoice) m += ` (Ini nampak macam delivery order/resit, bukan invoice cukai — colleague saya akan sahkan bukti pembelian.)`;
     m += ` Colleague kami akan verify status warranty berdasarkan ni.`;
     return m;
   }
-  let m = `Got your invoice ✅ I read: ${models}`;
+  let m = `Got it ✅ I read: ${models}`;
   m += dateShown ? `, purchase date ${dateShown}` : "";
   m += ".";
   m += dateShown ? ` Could you confirm the purchase date is correct?` : ` The purchase date isn't clear — could you type the purchase date?`;
-  if (multi) m += ` This invoice has a few fans — which one has the issue?`;
+  if (multi) m += ` There are a few fans here — which one has the issue?`;
+  if (notInvoice) m += ` (This looks like a delivery order/receipt rather than a tax invoice — my colleague will confirm the purchase proof.)`;
   m += ` My colleague will verify your warranty status from this.`;
   return m;
 }
@@ -734,7 +746,12 @@ bot.on("message", async (msg) => {
       let inv = null;
       try { inv = await tryReadInvoice(msg); }
       finally { invoiceInFlight.delete(chatId); }
-      if (inv && inv.isInvoice && inv.fanzLines.length > 0) {
+      // Accept as warranty proof when we read Fanz/Vioz fan line(s) AND either it
+      // reads as an invoice OR carries a purchase date. This lets delivery
+      // orders / receipts (isInvoice=false) through too — buildInvoiceEcho flags
+      // those with a caveat. A dateless non-invoice read is too weak → fall back.
+      const readDate = inv && (inv.purchaseDateIso || inv.purchaseDateRaw);
+      if (inv && inv.fanzLines.length > 0 && (inv.isInvoice || readDate)) {
         const models = inv.fanzLines
           .map((l) => `${l.modelText}${l.family ? ` (${l.family}/${l.brand})` : ` (${l.brand})`}`)
           .join("; ");
@@ -743,7 +760,8 @@ bot.on("message", async (msg) => {
         appendHistory(
           chatId,
           "user",
-          `[customer sent an INVOICE photo — auto-read, PLEASE VERIFY: ` +
+          `[customer sent a ${inv.isInvoice ? "INVOICE" : "PROOF DOC (delivery order/receipt — NOT a tax invoice)"} ` +
+          `photo — auto-read, PLEASE VERIFY: ` +
           `brand=${inv.brandResolved}; model(s)=${models}; ` +
           `purchase_date=${inv.purchaseDateIso || inv.purchaseDateRaw || "unclear"}` +
           `${inv.dateAmbiguous ? " (DATE AMBIGUOUS — confirm with customer)" : ""}; ` +
