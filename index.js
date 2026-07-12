@@ -20,7 +20,7 @@ const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID;
 
 // Warranty rules — real Fanz/Vioz policy from lib/warranty.js
-const { calcWarrantyStatus, isWarrantyVoid, inferBrand, POLICY_DISCLAIMER } = require("./lib/warranty");
+const { calcWarrantyStatus, isWarrantyVoid, inferBrand, POLICY_DISCLAIMER, WARRANTY_PERIODS } = require("./lib/warranty");
 
 // Deterministic guards — money red lines, trilingual detection, nudge, scripts.
 // The money rules are enforced HERE in code, not only in the prompt:
@@ -105,6 +105,7 @@ LINE B — Repair / Maintenance: Collect these items ONE AT A TIME. After each r
    Step 2 — What's the problem  AND  Which part is having the issue（马达/Motor、接收器/Receiver、LED灯/LED、遥控器/Remote、要求上门服务/On-site service、其他/Other — pick one）
    Step 3 — Invoice number OR a photo of the invoice (dealer invoices are fine too). If the customer already sent an invoice photo, note it and move on — do not ask again.
      If history contains an "[customer sent an INVOICE photo — auto-read...]" line, the invoice step is DONE: use its brand/model/purchase_date to fill the DATA fields (invoice:"photo"), do NOT re-ask for the invoice, and do NOT state a warranty verdict or say whether it's in/out of warranty — a colleague verifies that. You may still need Step 4/5 (address, time).
+     Exception: the SYSTEM itself may send a preliminary warranty assessment after the customer confirms the invoice date — you will see a "[system note: a preliminary warranty assessment was sent...]" line in history. Never restate, recompute, or contradict it; just continue the intake from the next missing step.
    Step 4 — Full address for the service visit, IN TEXT. Do NOT accept "it's on the invoice" / "you already have my address" / "follow the invoice" — the invoice address is NOT stored (privacy), so you genuinely do not have it. In that case reply that you don't keep the invoice address and ask the customer to type their full address. Once they give it, READ IT BACK to confirm before moving on: EN "Just to confirm, the address is [address] ya?" / ZH "帮你记的地址是 [地址]，麻烦确认一下对不对哦？" / MS "Nak confirm, alamat [alamat] betul ya?"
    Step 5 — PREFERRED date and time (preference only — see APPOINTMENT RULE)
 After all collected, STRICTLY FORBIDDEN: Do NOT write ANY closing/confirmation message. Just output the DATA marker on the last line. The system will automatically send the confirmation to the customer.
@@ -328,6 +329,15 @@ const mediaSeen = new Map(); // chatId -> true
 const invoiceInFlight = new Set(); // chatIds currently having an invoice read (avoid double echo on fast double-send)
 const senderNames = new Map(); // chatId -> Telegram display name, for the conversation log's sender_name
 
+// ── Preliminary warranty assessment (invoice photo path) ──
+// After an invoice echo, if the customer CONFIRMS the read date, the code (not
+// the LLM) computes a preliminary motor-warranty assessment from the confirmed
+// date + the brand printed on the invoice. Any other reply (corrected date,
+// which-fan answer) clears the pending state → conservative old path (human
+// verifies, no verdict). TTL keeps a stale echo from firing much later.
+const pendingInvoiceRead = new Map(); // chatId -> { brand, dateIso, at }
+const PENDING_INVOICE_TTL_MS = 10 * 60_000;
+
 // ── Guard debounce state ──────────────────────────
 // Unpaid gate fires ONCE per chat (first repair mention) — re-triggering on
 // every keyword hit would derail a live intake ("receiver problem" is an
@@ -353,6 +363,7 @@ function sweepIdleState() {
       unpaidGateFired.delete(id);
       nudgeEscalatedAt.delete(id);
       senderNames.delete(id);
+      pendingInvoiceRead.delete(id);
     }
   }
 }
@@ -760,6 +771,51 @@ function buildInvoiceEcho(inv, lang) {
   return m;
 }
 
+// A terse "yes/correct/对/betul"-style reply. Only used while a pendingInvoiceRead
+// exists, i.e. right after the echo asked "confirm the purchase date?" — so a
+// bare "ya" here IS an answer to that question, not filler.
+function isDateConfirmation(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (!t) return false;
+  if (/^(yes|yes correct|correct|yup|yeah|ok(ay)?|right|confirm(ed)?|betul|ya betul|ya|对|对的|对啊|对哦|没错|正确|是的|是)[.!。~\s]*$/i.test(t)) return true;
+  return /(date|tarikh|日期)[^,;.!?]{0,8}(is\s*)?(correct|right|betul|对|没错)/i.test(t);
+}
+
+// Deterministic preliminary warranty message — computed in CODE from the
+// customer-confirmed date + the brand printed on the invoice. Never quotes an
+// amount, always carries the "colleague verifies / technician confirms"
+// disclaimer. Returns null if anything is off (invalid date / unknown brand) —
+// caller then falls back to the conservative human-verify path.
+function buildPreliminaryWarrantyMsg(pending, lang) {
+  const years = (WARRANTY_PERIODS[pending.brand] || {}).motor;
+  if (!years) return null;
+  const purchased = new Date(pending.dateIso);
+  if (isNaN(purchased.getTime())) return null;
+  const expiry = new Date(purchased);
+  expiry.setFullYear(expiry.getFullYear() + years);
+  const inW = new Date() < expiry;
+  const expStr = expiry.toISOString().slice(0, 10);
+  const brandLabel = pending.brand === "vioz" ? "Vioz" : "Fanz";
+  const ledNote = {
+    en: pending.brand === "vioz" ? "Receiver parts have a 2-year warranty; LED coverage my colleague will confirm." : "Receiver/LED parts have a 2-year warranty.",
+    zh: pending.brand === "vioz" ? "接收器这些部件是 2 年保修；LED 部分同事会再确认。" : "接收器/LED 这些部件是 2 年保修。",
+    ms: pending.brand === "vioz" ? "Part receiver warranty 2 tahun; untuk LED colleague saya akan confirm." : "Part receiver/LED warranty 2 tahun.",
+  };
+  if (lang === "zh") {
+    return inW
+      ? `好的，按你确认的购买日期 ${pending.dateIso}，这台 ${brandLabel} 风扇的马达保修（${years}年）算到 ${expStr}，应该还在保修期内。${ledNote.zh} 这个是初步判断哦——同事会再核实发票，师傅上门也会确认。`
+      : `好的，按你确认的购买日期 ${pending.dateIso}，这台 ${brandLabel} 风扇的马达保修（${years}年）到 ${expStr} 已经过了。费用方面同事会跟你确认。这个是初步判断哦——以核实发票为准。`;
+  }
+  if (lang === "ms") {
+    return inW
+      ? `Okay, ikut tarikh beli yang awak confirm (${pending.dateIso}), warranty motor kipas ${brandLabel} ni (${years} tahun) sampai ${expStr} — jadi motor sepatutnya masih dalam warranty. ${ledNote.ms} Ini preliminary check ya — colleague saya akan verify invoice, technician pun akan confirm masa datang.`
+      : `Okay, ikut tarikh beli yang awak confirm (${pending.dateIso}), warranty motor kipas ${brandLabel} ni (${years} tahun) dah tamat pada ${expStr}. Pasal caj, colleague saya akan confirm dengan awak. Ini preliminary check ya — tertakluk pada verification invoice.`;
+  }
+  return inW
+    ? `Thanks for confirming. Based on the purchase date ${pending.dateIso}, your ${brandLabel} fan's motor warranty (${years} years) runs until ${expStr} — so the motor should still be under warranty. ${ledNote.en} This is a preliminary check ya — my colleague will verify the invoice, and the technician confirms on site.`
+    : `Thanks for confirming. Based on the purchase date ${pending.dateIso}, your ${brandLabel} fan's motor warranty (${years} years) ended on ${expStr} — so the motor warranty has expired. My colleague will confirm the charges with you. This is a preliminary check ya — subject to invoice verification.`;
+}
+
 async function tryTranscribeVoice(msg) {
   const media = msg.voice || msg.audio;
   if (!media || !transcribeConfigured()) return null;
@@ -865,6 +921,14 @@ bot.on("message", async (msg) => {
           "assistant",
           "[invoice reading echoed to customer for date confirmation; colleague verifies warranty — do not state a warranty verdict yet]"
         );
+        // Arm the preliminary-assessment step: only when we read an ISO date AND
+        // the invoice itself resolved a single brand. Anything less stays on the
+        // conservative human-verify path.
+        if (inv.purchaseDateIso && (inv.brandResolved === "fanz" || inv.brandResolved === "vioz")) {
+          pendingInvoiceRead.set(chatId, { brand: inv.brandResolved, dateIso: inv.purchaseDateIso, at: Date.now() });
+        } else {
+          pendingInvoiceRead.delete(chatId);
+        }
         return;
       }
     }
@@ -933,6 +997,26 @@ async function processCustomerText(chatId, text, opts = {}) {
     await sendWithSplit(chatId, script("unpaid", langNow), undefined, { aiModel: "deterministic", intent: "unpaid_gate" });
     await insertEscalation(chatId, "unpaid_repair_request", text.slice(0, 300));
     return;
+  }
+
+  // ── PRELIMINARY WARRANTY — customer confirmed the invoice date ──
+  // Deterministic: code computes the assessment from the confirmed date + the
+  // brand printed on the invoice. Any other reply clears the pending state and
+  // falls through to the normal flow (human verifies, no verdict).
+  const pendingInv = pendingInvoiceRead.get(chatId);
+  if (pendingInv) {
+    pendingInvoiceRead.delete(chatId); // one shot, whatever the reply is
+    const fresh = Date.now() - (pendingInv.at || 0) < PENDING_INVOICE_TTL_MS;
+    if (fresh && isDateConfirmation(text)) {
+      const prelimMsg = buildPreliminaryWarrantyMsg(pendingInv, langNow);
+      if (prelimMsg) {
+        appendHistory(chatId, "user", historyText);
+        appendHistory(chatId, "assistant",
+          `[system note: a preliminary warranty assessment was sent based on the customer-confirmed invoice date (brand=${pendingInv.brand}, purchase_date=${pendingInv.dateIso}). The invoice step is DONE (invoice:"photo"). Continue the intake from where it left off (issue part if unknown, then address, then preferred time). Never restate or contradict the assessment — final verification is by a colleague.]`);
+        await sendWithSplit(chatId, prelimMsg, undefined, { aiModel: "deterministic", intent: "warranty_preliminary" });
+        return;
+      }
+    }
   }
 
   // ── NUDGE — bare "?" / "any update" means "chase progress" ──
@@ -1165,7 +1249,11 @@ module.exports = {
   processCustomerText,
   buildInvoiceEcho, // pure helper, exported for tests
   logConversation, // conversation-log writer, exported for tests
+  buildPreliminaryWarrantyMsg, // pure helper, exported for tests
+  isDateConfirmation, // pure helper, exported for tests
   // scenario-test seams (SKIP_BOT_INIT only)
+  __setPendingInvoice: (chatId, p) => pendingInvoiceRead.set(chatId, p),
+  __getPendingInvoice: (chatId) => pendingInvoiceRead.get(chatId),
   __getSent: () => __sentMessages.slice(),
   __clearSent: () => { __sentMessages.length = 0; },
 };
