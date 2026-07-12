@@ -7,6 +7,10 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.MODEL || "gpt-4o";
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
+// Conversation-log constants (persistent history → conversations table)
+const PLATFORM = "telegram";
+const BOT_SENDER_NAME = "Fann (小凡)";
+
 // Supabase (Fanz project)
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
@@ -317,6 +321,7 @@ async function hasUnpaidOrder(chatId) {
 // Track per chat so the work order carries has_media.
 const mediaSeen = new Map(); // chatId -> true
 const invoiceInFlight = new Set(); // chatIds currently having an invoice read (avoid double echo on fast double-send)
+const senderNames = new Map(); // chatId -> Telegram display name, for the conversation log's sender_name
 
 // ── Guard debounce state ──────────────────────────
 // Unpaid gate fires ONCE per chat (first repair mention) — re-triggering on
@@ -342,6 +347,7 @@ function sweepIdleState() {
       unpaidCache.delete(id);
       unpaidGateFired.delete(id);
       nudgeEscalatedAt.delete(id);
+      senderNames.delete(id);
     }
   }
 }
@@ -372,6 +378,73 @@ async function insertComplaint(chatId, category, content) {
   } catch (err) {
     console.error("Supabase insertComplaint error:", err.message);
     return false;
+  }
+}
+
+// ── Conversation log (persistent history → conversations table) ────
+// Records one row per real inbound/outbound message so the full dialogue is
+// queryable (Dashboard /conversations) instead of living only in the 16-entry
+// in-memory buffer. Fire-and-forget: this must never block or break a reply, so
+// it is called WITHOUT await and swallows its own errors.
+//
+// The extended columns (platform / sender_name / message_type / ai_model_used)
+// may not exist until the ALTER TABLE migration runs — on a missing-column
+// error we retry with the base columns (chat_id/role/content/intent) so logging
+// works pre-migration too. Same tolerate-missing-column pattern as work_orders.
+async function logConversation(chatId, role, content, meta = {}) {
+  if (!SUPABASE_SERVICE_KEY) return;
+  const text = content == null ? "" : String(content);
+  if (!text.trim()) return;
+  const senderName =
+    meta.senderName ||
+    (role === "assistant" ? BOT_SENDER_NAME : senderNames.get(chatId) || null);
+  const base = {
+    chat_id: String(chatId),
+    role,
+    content: text,
+    intent: meta.intent || null,
+  };
+  const extended = {
+    ...base,
+    platform: PLATFORM,
+    sender_name: senderName,
+    message_type: meta.messageType || "text",
+    ai_model_used: meta.aiModel || null,
+  };
+
+  async function tryInsert(payload) {
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/conversations`, {
+      method: "POST",
+      headers: SUPABASE_HEADERS,
+      body: JSON.stringify(payload),
+    });
+    if (resp.ok) return { ok: true };
+    return { ok: false, status: resp.status, text: await resp.text() };
+  }
+
+  // The intent column may carry a legacy CHECK constraint (conversations_intent_check)
+  // that only allows a fixed value set. If a classification value is rejected
+  // (23514), drop intent to null and retry — logging the message must never fail
+  // over a metadata value. (The migration relaxes this constraint permanently.)
+  async function insertWithIntentFallback(payload) {
+    let r = await tryInsert(payload);
+    if (!r.ok && /23514/.test(r.text || "") && payload.intent != null) {
+      r = await tryInsert({ ...payload, intent: null });
+    }
+    return r;
+  }
+
+  try {
+    let r = await insertWithIntentFallback(extended);
+    if (!r.ok && /column|PGRST204|42703/i.test(r.text || "")) {
+      console.warn("logConversation: extended columns missing, retrying base payload (run the ALTER TABLE migration)");
+      r = await insertWithIntentFallback(base);
+    }
+    if (!r.ok) {
+      console.error(`Supabase logConversation failed (${r.status}):`, r.text);
+    }
+  } catch (err) {
+    console.error("Supabase logConversation error:", err.message);
   }
 }
 
@@ -713,6 +786,12 @@ bot.on("message", async (msg) => {
   const chatId = msg.chat.id;
   const text = (msg.text || "").trim();
 
+  // Remember the customer's display name for the conversation log's sender_name.
+  const fromName = msg.from
+    ? [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ").trim() || msg.from.username || null
+    : null;
+  if (fromName) senderNames.set(chatId, fromName);
+
   // Skip commands handled above
   if (text.startsWith("/")) return;
 
@@ -735,6 +814,14 @@ bot.on("message", async (msg) => {
     }
 
     const lang = detectLangFromHistory(chatId, msg.caption || "");
+
+    // Persist the inbound media as one user row (voice that transcribed OK has
+    // already returned above and is logged as text inside processCustomerText).
+    const mediaLogType =
+      mediaType === "photo" ? "image" : mediaType === "video" ? "video" : mediaType === "voice" ? "voice" : "file";
+    void logConversation(chatId, "user", msg.caption || `[${mediaType === "other" ? "file" : mediaType}]`, {
+      messageType: mediaLogType,
+    });
 
     // Photo / image file: try to read it as a warranty-proof invoice. If it
     // genuinely reads as an invoice with Fanz/Vioz lines, echo the reading for
@@ -767,7 +854,7 @@ bot.on("message", async (msg) => {
           `${inv.dateAmbiguous ? " (DATE AMBIGUOUS — confirm with customer)" : ""}; ` +
           `dealer=${inv.dealer || "?"}; read_confidence=${inv.confidence}]`
         );
-        await sendWithSplit(chatId, buildInvoiceEcho(inv, lang));
+        await sendWithSplit(chatId, buildInvoiceEcho(inv, lang), undefined, { intent: "invoice_echo" });
         appendHistory(
           chatId,
           "assistant",
@@ -780,7 +867,7 @@ bot.on("message", async (msg) => {
     // Annotate history so the LLM knows evidence exists and intake can skip re-asking
     const label = { photo: "photo", video: "video", voice: "voice message", other: "file" }[mediaType];
     appendHistory(chatId, "user", `[customer sent a ${label}${msg.caption ? `, caption: "${msg.caption}"` : ""}]`);
-    await sendWithSplit(chatId, script(`media_${mediaType}`, lang));
+    await sendWithSplit(chatId, script(`media_${mediaType}`, lang), undefined, { aiModel: "deterministic", intent: "media_ack" });
     return;
   }
 
@@ -807,6 +894,15 @@ async function processCustomerText(chatId, text, opts = {}) {
   // Discount/bargaining and compensation/claims are never left to the
   // model's judgement: fixed script + escalation record, conversation over.
   const moneyIntent = detectMoneyIntent(text);
+
+  // Persist the inbound customer message (one user row) with a cheap intent
+  // classification. Covers typed text and transcribed voice; all downstream
+  // branches share this single log point.
+  const userIntent = moneyIntent || (isNudge(text) ? "nudge" : detectRepairIntent(text) ? "repair" : null);
+  void logConversation(chatId, "user", text, {
+    intent: userIntent,
+    messageType: opts.fromVoice ? "voice" : "text",
+  });
   if (moneyIntent) {
     appendHistory(chatId, "user", historyText);
     const reply = script(moneyIntent, langNow);
@@ -815,7 +911,7 @@ async function processCustomerText(chatId, text, opts = {}) {
     // rather than treating the fixed script as its own conversational turn.
     appendHistory(chatId, "assistant",
       `[system note: the ${moneyIntent} topic was escalated to a human colleague and the customer was informed. Continue helping with the fan issue from where the conversation left off.]`);
-    await sendWithSplit(chatId, reply);
+    await sendWithSplit(chatId, reply, undefined, { aiModel: "deterministic", intent: moneyIntent });
     await insertEscalation(chatId, moneyIntent, text.slice(0, 300));
     return;
   }
@@ -829,7 +925,7 @@ async function processCustomerText(chatId, text, opts = {}) {
     appendHistory(chatId, "user", historyText);
     appendHistory(chatId, "assistant",
       "[system note: customer has an outstanding payment; they were asked to settle it first and a colleague will follow up. Do not arrange a new appointment; you may still answer product questions.]");
-    await sendWithSplit(chatId, script("unpaid", langNow));
+    await sendWithSplit(chatId, script("unpaid", langNow), undefined, { aiModel: "deterministic", intent: "unpaid_gate" });
     await insertEscalation(chatId, "unpaid_repair_request", text.slice(0, 300));
     return;
   }
@@ -839,7 +935,7 @@ async function processCustomerText(chatId, text, opts = {}) {
     appendHistory(chatId, "user", historyText);
     const reply = script("nudge", langNow);
     appendHistory(chatId, "assistant", reply);
-    await sendWithSplit(chatId, reply);
+    await sendWithSplit(chatId, reply, undefined, { aiModel: "deterministic", intent: "nudge" });
     // Escalate at most once per cooldown — five "?" in a row is one chase,
     // not five complaint rows.
     const lastEsc = nudgeEscalatedAt.get(chatId) || 0;
@@ -980,7 +1076,7 @@ async function processCustomerText(chatId, text, opts = {}) {
       }
 
       // Send reply (strip marker)
-      await sendWithSplit(chatId, finalMsg);
+      await sendWithSplit(chatId, finalMsg, undefined, { aiModel: MODEL, intent: "WORKORDER_READY" });
       return;
     }
 
@@ -993,7 +1089,7 @@ async function processCustomerText(chatId, text, opts = {}) {
         finalMsg += "\n\n" + tr("complaint_busy", lang);
       }
 
-      await sendWithSplit(chatId, finalMsg);
+      await sendWithSplit(chatId, finalMsg, undefined, { aiModel: MODEL, intent: "COMPLAINT_READY" });
       return;
     }
 
@@ -1001,12 +1097,12 @@ async function processCustomerText(chatId, text, opts = {}) {
     if (marker === "HANDOFF_READY" && data) {
       await insertEscalation(chatId, data.reason || "other", data.summary || "");
       const finalMsg = clean || tr("handoff_recorded", lang);
-      await sendWithSplit(chatId, finalMsg);
+      await sendWithSplit(chatId, finalMsg, undefined, { aiModel: MODEL, intent: "HANDOFF_READY" });
       return;
     }
 
     // ── No marker — send reply as-is ────────────────
-    await sendWithSplit(chatId, reply);
+    await sendWithSplit(chatId, reply, undefined, { aiModel: MODEL });
   } catch (err) {
     console.error(`[chatId=${chatId}] Error:`, err.message);
     bot.sendMessage(chatId, tr("error_connect", detectLang(text)));
@@ -1027,7 +1123,7 @@ function splitMessage(text, maxLen = 4096) {
   return chunks;
 }
 
-async function sendWithSplit(chatId, text, options) {
+async function sendWithSplit(chatId, text, options, logMeta = {}) {
   if (text.length <= 4096) {
     await bot.sendMessage(chatId, text, options);
   } else {
@@ -1036,6 +1132,9 @@ async function sendWithSplit(chatId, text, options) {
       await bot.sendMessage(chatId, chunk, options);
     }
   }
+  // Persist the full outbound reply as one assistant row (the message the
+  // customer actually saw). Every customer-facing reply funnels through here.
+  void logConversation(chatId, "assistant", text, logMeta);
 }
 
 // ── Graceful Shutdown ────────────────────────────
@@ -1060,6 +1159,7 @@ module.exports = {
   classifyMedia,
   processCustomerText,
   buildInvoiceEcho, // pure helper, exported for tests
+  logConversation, // conversation-log writer, exported for tests
   // scenario-test seams (SKIP_BOT_INIT only)
   __getSent: () => __sentMessages.slice(),
   __clearSent: () => { __sentMessages.length = 0; },
