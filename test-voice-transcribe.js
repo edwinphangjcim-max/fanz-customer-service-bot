@@ -59,6 +59,23 @@ const t = (cond, msg) => { cond ? (pass++, console.log(`PASS: ${msg}`)) : (fail+
     t(r2.ok === true, `discount phrase transcribed (got: "${(r2.text || r2.error || "").slice(0, 60)}")`);
     t(r2.ok && detectMoneyIntent(r2.text) === "discount", "voice discount trips the money red line");
 
+    // Case 2b: REGRESSION — Telegram's real container/codec (OGG/Opus) with the
+    // real .oga extension. This is the exact live shape that failed in prod
+    // (gpt-4o-transcribe rejects the "oga" alias: 400 Unsupported file format,
+    // 2026-07-12). Requires ffmpeg to encode opus; skipped when unavailable.
+    let hasFfmpeg = true;
+    try { execSync("which ffmpeg", { stdio: "ignore" }); } catch { hasFfmpeg = false; }
+    if (hasFfmpeg) {
+      execSync(`say -o /tmp/fanz-t2b.aiff "My fan remote is not working"`);
+      execSync(`ffmpeg -y -loglevel error -i /tmp/fanz-t2b.aiff -c:a libopus -b:a 32k /tmp/fanz-t2b.oga`);
+      const r2b = await transcribeVoice(fs.readFileSync("/tmp/fanz-t2b.oga"), "voice.oga");
+      t(r2b.ok === true, `Telegram-shape OGG/Opus .oga transcribed (got: "${(r2b.text || r2b.error || "").slice(0, 60)}")`);
+      t(r2b.ok && /remote|fan/i.test(r2b.text), ".oga transcription contains key words");
+      try { fs.unlinkSync("/tmp/fanz-t2b.aiff"); fs.unlinkSync("/tmp/fanz-t2b.oga"); } catch (_) {}
+    } else {
+      console.log("SKIP: ffmpeg unavailable — .oga (Telegram-shape) regression case skipped");
+    }
+
     // Case 3: real Malay fault description (only meaningful with a real ms_MY voice)
     if (hasMalayVoice) {
       const { detectRepairIntent } = require("./lib/guards");
